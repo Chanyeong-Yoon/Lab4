@@ -138,10 +138,12 @@ bool cache_base_c::access(addr_t address, int access_type, bool is_fill, addr_t 
     addr_t ev_line = 0;
     bool   ev_dirty_flag = false;
     auto  &ve = set->m_entry[victim];
-    if (ve.m_valid && ve.m_dirty) {
-        m_num_writebacks++;
+    if (ve.m_valid) {
         ev_line = (ve.m_tag * m_num_sets + idx) * (addr_t)m_line_size;
-        ev_dirty_flag = true;
+        if (ve.m_dirty) {
+            m_num_writebacks++;
+            ev_dirty_flag = true;
+        }
     }
     if (evict_addr)  *evict_addr  = ev_line;
     if (evict_dirty) *evict_dirty = ev_dirty_flag;
@@ -198,4 +200,80 @@ void cache_base_c::dump_tag_store(bool is_file) {
   } else {
     write(std::cout);
   }
+}
+
+bool cache_base_c::invalidate(addr_t address, bool* was_dirty)
+{
+    addr_t line_num = address / m_line_size;
+    int idx = line_num % m_num_sets;
+    addr_t tag = line_num / m_num_sets;
+
+    auto* set = m_set[idx];
+    for (int way = 0; way < set->m_assoc; ++way) {
+        auto& ent = set->m_entry[way];
+        if (ent.m_valid && ent.m_tag == tag) {
+            if (was_dirty) *was_dirty = ent.m_dirty;
+            ent.m_valid = false;
+            ent.m_dirty = false;
+            set->m_lru_list.remove(way);
+            set->m_lru_list.push_front(way);
+            return true;
+        }
+    }
+    if (was_dirty) *was_dirty = false;
+    return false;
+}
+
+bool cache_base_c::install_writeback(addr_t address,
+                                     addr_t *evict_addr,
+                                     bool   *evict_dirty)
+{
+    addr_t line_num = address / m_line_size;
+    int idx = line_num % m_num_sets;
+    addr_t tag = line_num / m_num_sets;
+
+    auto* set = m_set[idx];
+    // check hit first
+    for (int way = 0; way < set->m_assoc; ++way) {
+        auto &ent = set->m_entry[way];
+        if (ent.m_valid && ent.m_tag == tag) {
+            ent.m_dirty = true;
+            if (evict_addr)  *evict_addr  = 0;
+            if (evict_dirty) *evict_dirty = false;
+            return true;
+        }
+    }
+
+    // choose victim
+    int victim = -1;
+    for (int way : set->m_lru_list) {
+        if (!set->m_entry[way].m_valid) { victim = way; break; }
+    }
+    if (victim < 0) {
+        victim = set->m_lru_list.back();
+        set->m_lru_list.pop_back();
+    } else {
+        set->m_lru_list.remove(victim);
+    }
+
+    addr_t ev_line = 0; bool ev_dirty_flag = false;
+    auto &ve = set->m_entry[victim];
+    if (ve.m_valid) {
+        ev_line = (ve.m_tag * m_num_sets + idx) * (addr_t)m_line_size;
+        if (ve.m_dirty) {
+            m_num_writebacks++;
+            ev_dirty_flag = true;
+        }
+    }
+    if (evict_addr)  *evict_addr  = ev_line;
+    if (evict_dirty) *evict_dirty = ev_dirty_flag;
+
+    ve.m_valid = true;
+    ve.m_tag   = tag;
+    ve.m_dirty = true;
+
+    // place to LRU position since this was not a demand access
+    set->m_lru_list.push_back(victim);
+
+    return false;
 }

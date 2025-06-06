@@ -75,6 +75,14 @@ public:
   void print_stats();
   void dump_tag_store(bool is_file);  // false: dump to stdout, true: dump to a file
 
+  // invalidate the cacheline if present; return true if invalidated
+  bool invalidate(addr_t address, bool* was_dirty = nullptr);
+
+  // install a write-back line without touching LRU stack
+  bool install_writeback(addr_t address,
+                         addr_t *evict_addr = nullptr,
+                         bool   *evict_dirty = nullptr);
+
 private:
   std::string m_name;     // cache name
   int m_num_sets;         // number of sets
