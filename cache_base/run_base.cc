@@ -23,7 +23,7 @@ void process_trace(cache_base_c* cache, const char* name) {
   if (trace_file.is_open()) {
     while (std::getline(trace_file, line)) {
       std::sscanf(line.c_str(), "%d %lx", &type, &address);
-        cache->access(address, type, 1);
+      cache->access(address, type, 0);
     }
   }
 }

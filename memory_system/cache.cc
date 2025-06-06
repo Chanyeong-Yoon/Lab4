@@ -115,6 +115,28 @@ void cache_c::process_in_queue() {
     bool hit = cache_base_c::access(req->m_addr, req->m_type, /*is_fill*/false,
                                     &ev_addr, &ev_dirty);
 
+    if (m_level == MEM_L2 && ev_addr) {
+      if (m_prev_d) {
+        bool d = false;
+        if (m_prev_d->invalidate(ev_addr, &d)) {
+          m_prev_d->m_num_backinvals++;
+          if (d) {
+            m_prev_d->m_num_writebacks_backinval++;
+            auto* wb2 = new mem_req_s(ev_addr, REQ_WB);
+            wb2->m_dirty = true;
+            wb2->m_rdy_cycle = m_cycle;
+            m_wb_queue->push(wb2);
+          }
+        }
+      }
+      if (m_prev_i) {
+        bool d2 = false;
+        if (m_prev_i->invalidate(ev_addr, &d2)) {
+          m_prev_i->m_num_backinvals++;
+        }
+      }
+    }
+
     // Victim → wb_queue
     if (ev_dirty) {
       auto* wb = new mem_req_s(ev_addr, REQ_WB);
@@ -126,22 +148,28 @@ void cache_c::process_in_queue() {
     it = m_in_queue->m_entry.erase(it);   // pop
 
     if (hit) {
-      // 최상위(코어쪽) 캐시면 코어로 데이터 반환
       if (!m_prev_i && !m_prev_d && done_func) {
         req->m_rdy_cycle = m_cycle;
         done_func(req);
-      } else if (m_prev_d) {      // 상위 D-캐시로 Fill
-        m_prev_d->fill(req);
-      } else if (m_prev_i) {      // 상위 I-캐시로 Fill
-        m_prev_i->fill(req);
+      } else {
+        if (req->m_type == REQ_IFETCH && m_prev_i)
+          m_prev_i->fill(req);
+        else if (m_prev_d)
+          m_prev_d->fill(req);
+        else if (m_prev_i)
+          m_prev_i->fill(req);
       }
     } else {
-      // 미스 → out_queue
+      // miss -> out_queue
       req->m_rdy_cycle = m_cycle;
+      if (req->m_type == REQ_DSTORE) {
+        req->m_dirty = true;          // remember to mark dirty on fill
+        req->m_type = REQ_DFETCH;     // treat as read for lower levels
+      }
       m_out_queue->push(req);
     }
   }
-} 
+}
 
 /** 
  * This function processes the output queue.
@@ -154,8 +182,10 @@ void cache_c::process_out_queue() {
     if (req->m_rdy_cycle > m_cycle) { ++it; continue; }
 
     bool accepted = false;
-    if (m_next)          accepted = m_next->access(req);
-    else if (m_memory)   accepted = m_memory->access(req);
+    if (m_next)
+      accepted = m_next->access(req);
+    else if (m_memory)
+      accepted = m_memory->access(req);
     else                 assert(false && "No next-level defined!");
 
     if (accepted) it = m_out_queue->m_entry.erase(it);
@@ -175,8 +205,36 @@ void cache_c::process_fill_queue() {
     if (req->m_rdy_cycle > m_cycle) { ++it; continue; }
 
     addr_t ev_addr = 0; bool ev_dirty = false;
-    cache_base_c::access(req->m_addr, req->m_type, /*is_fill*/true,
-                         &ev_addr, &ev_dirty);
+    if (req->m_type == REQ_WB) {
+      cache_base_c::install_writeback(req->m_addr, &ev_addr, &ev_dirty);
+    } else {
+      int fill_type = req->m_type;
+      if (req->m_dirty && m_level == MEM_L1 && req->m_type == REQ_DFETCH)
+        fill_type = REQ_DSTORE;
+      cache_base_c::access(req->m_addr, fill_type, /*is_fill*/true,
+                           &ev_addr, &ev_dirty);
+    }
+
+    if (m_level == MEM_L2 && ev_addr) {
+      if (m_prev_d) {
+        bool d=false;
+        if (m_prev_d->invalidate(ev_addr, &d)) {
+          m_prev_d->m_num_backinvals++;
+          if (d) {
+            m_prev_d->m_num_writebacks_backinval++;
+            auto* wb2 = new mem_req_s(ev_addr, REQ_WB);
+            wb2->m_dirty = true;
+            wb2->m_rdy_cycle = m_cycle;
+            m_wb_queue->push(wb2);
+          }
+        }
+      }
+      if (m_prev_i) {
+        bool d2=false;
+        if (m_prev_i->invalidate(ev_addr, &d2))
+          m_prev_i->m_num_backinvals++;
+      }
+    }
 
     // Victim write-back
     if (ev_dirty) {
@@ -188,14 +246,16 @@ void cache_c::process_fill_queue() {
 
     it = m_fill_queue->m_entry.erase(it);   // pop
 
-    // 상위/코어로 데이터 반환
     if (!m_prev_i && !m_prev_d && done_func) {
       req->m_rdy_cycle = m_cycle;
       done_func(req);
-    } else if (m_prev_d) {
-      m_prev_d->fill(req);
-    } else if (m_prev_i) {
-      m_prev_i->fill(req);
+    } else if (req->m_type != REQ_WB) {
+      if (req->m_type == REQ_IFETCH && m_prev_i)
+        m_prev_i->fill(req);
+      else if (m_prev_d)
+        m_prev_d->fill(req);
+      else if (m_prev_i)
+        m_prev_i->fill(req);
     }
   }
 }
@@ -211,8 +271,10 @@ void cache_c::process_wb_queue() {
     if (req->m_rdy_cycle > m_cycle) { ++it; continue; }
 
     bool accepted = false;
-    if (m_next)          accepted = m_next->access(req);
-    else if (m_memory)   accepted = m_memory->access(req);
+    if (m_next)
+      accepted = m_next->fill(req);
+    else if (m_memory)
+      accepted = m_memory->access(req);
 
     if (accepted) {
       it = m_wb_queue->m_entry.erase(it);
